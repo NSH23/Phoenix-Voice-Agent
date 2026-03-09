@@ -21,27 +21,29 @@ const supabase = axios.create({
 
 async function sendWhatsApp(phone, message) {
   try {
-    await axios.post(
-      'https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
-      { messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: message } },
-      { headers: { Authorization: 'Bearer ' + WA_TOKEN } }
+    var fullPhone = phone.startsWith("+") ? phone : "+" + phone;
+    var resp = await axios.post(
+      "https://graph.facebook.com/v18.0/" + WA_PHONE_ID + "/messages",
+      { messaging_product: "whatsapp", to: fullPhone, type: "text", text: { body: message } },
+      { headers: { Authorization: "Bearer " + WA_TOKEN } }
     );
-    console.log('WA sent to ' + phone);
+    console.log("✅ WA sent to " + fullPhone + " | " + JSON.stringify(resp.data));
   } catch (err) {
-    console.error('WA error:', JSON.stringify(err.response ? err.response.data : err.message));
+    console.error("❌ WA FAILED:", JSON.stringify(err.response ? err.response.data : err.message));
   }
 }
 
 async function sendWhatsAppImage(phone, imageUrl, caption) {
   try {
-    await axios.post(
-      'https://graph.facebook.com/v18.0/' + WA_PHONE_ID + '/messages',
-      { messaging_product: 'whatsapp', to: phone, type: 'image', image: { link: imageUrl, caption: caption } },
-      { headers: { Authorization: 'Bearer ' + WA_TOKEN } }
+    var fullPhone = phone.startsWith("+") ? phone : "+" + phone;
+    var resp = await axios.post(
+      "https://graph.facebook.com/v18.0/" + WA_PHONE_ID + "/messages",
+      { messaging_product: "whatsapp", to: fullPhone, type: "image", image: { link: imageUrl, caption: caption } },
+      { headers: { Authorization: "Bearer " + WA_TOKEN } }
     );
-    console.log('WA image sent to ' + phone);
+    console.log("✅ WA image sent to " + fullPhone + " | " + JSON.stringify(resp.data));
   } catch (err) {
-    console.error('WA image error:', JSON.stringify(err.response ? err.response.data : err.message));
+    console.error("❌ WA image FAILED:", JSON.stringify(err.response ? err.response.data : err.message));
   }
 }
 
