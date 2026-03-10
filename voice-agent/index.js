@@ -5,7 +5,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const SUPABASE_URL = 'https://fhhwfqlbgmsscmqihjyz.supabase.co';
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZoaHdmcWxiZ21zc2NtcWloanl6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0MzgwNTksImV4cCI6MjA4NzAxNDA1OX0.T1n19S4_D7eNX4bz9AovBXwKrwOjGxvrzFGpO4nNxJ4';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZoaHdmcWxiZ21zc2NtcWloanl6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0MzgwNTksImV4cCI6MjA4NzAxNDA1OX0.T1n19S4_D7eNX4bz9AovBXwKrwOjGxvrzFGpO4nNxJ4';
 const WA_TOKEN = process.env.WA_TOKEN;
 const WA_PHONE_ID = '1023140200877702';
 
@@ -78,7 +78,6 @@ async function getEventImage(eventType) {
       if (row.text_content) return row.text_content;
     }
 
-    // Fallback: search media_assets by subcategory
     var fallback = await supabase.get(
       '/rest/v1/media_assets?subcategory=eq.' + eventType.toLowerCase() +
       '&is_active=eq.true&file_type=eq.image&select=public_url&order=sort_order.asc&limit=1'
@@ -103,28 +102,51 @@ async function saveVoiceCall(data) {
       gathered_venue: data.venue_name,
       gathered_guest_count: parseGuestCount(data.guest_count),
       gathered_event_date: data.event_date || null,
-      whatsapp_sent: false
+      whatsapp_sent: false,
+      duration_seconds: data.duration_seconds || 0,
+      call_outcome: data.event_type ? 'data_collected' : 'no_data'
     });
-    console.log('Voice call saved for', data.phone);
+    console.log('Voice call saved for', data.phone, '| duration:', data.duration_seconds || 0, 's');
   } catch (err) {
     console.error('Supabase save error:', JSON.stringify(err.response ? err.response.data : err.message));
   }
 }
 
+async function logConversation(phone, content, direction) {
+  try {
+    await supabase.post('/rest/v1/conversations', {
+      lead_phone: phone,
+      direction: direction || 'outbound',
+      message_type: 'voice',
+      content: content,
+      status: 'completed',
+      channel: 'voice'
+    });
+  } catch (e) {}
+}
+
 async function upsertLead(data) {
   try {
-    var existing = await supabase.get('/rest/v1/leads?phone=eq.' + data.phone + '&select=id,call_count');
+    var existing = await supabase.get('/rest/v1/leads?phone=eq.' + data.phone + '&select=id,call_count,call_duration_seconds,first_channel');
     var isNew = !existing.data || existing.data.length === 0;
-    var callCount = isNew ? 1 : ((existing.data[0].call_count || 0) + 1);
+    var existingRecord = isNew ? null : existing.data[0];
+
+    var callCount = isNew ? 1 : ((existingRecord.call_count || 0) + 1);
+    var totalDuration = isNew
+      ? (data.duration_seconds || 0)
+      : ((existingRecord.call_duration_seconds || 0) + (data.duration_seconds || 0));
 
     var payload = {
       phone: data.phone,
       updated_at: new Date().toISOString(),
       last_interaction: new Date().toISOString(),
+      last_channel: 'voice',
       voice_qualified: true,
       last_call_at: new Date().toISOString(),
-      call_count: callCount
+      call_count: callCount,
+      call_duration_seconds: totalDuration
     };
+
     if (data.name && data.name !== 'Guest') payload.name = data.name;
     if (data.event_type) payload.event_type = data.event_type;
     if (data.venue_name) payload.venue = data.venue_name;
@@ -134,11 +156,14 @@ async function upsertLead(data) {
     if (isNew) {
       payload.source = 'voice_call';
       payload.status = 'new';
+      payload.first_channel = 'voice';
+      payload.whatsapp_count = 0;
       await supabase.post('/rest/v1/leads', payload);
       console.log('New lead created for', data.phone);
     } else {
+      if (!existingRecord.first_channel) payload.first_channel = 'voice';
       await supabase.patch('/rest/v1/leads?phone=eq.' + data.phone, payload);
-      console.log('Lead updated for', data.phone, '| call_count:', callCount);
+      console.log('Lead updated for', data.phone, '| call_count:', callCount, '| total_duration:', totalDuration + 's');
     }
   } catch (err) {
     console.error('upsertLead error:', JSON.stringify(err.response ? err.response.data : err.message));
@@ -188,10 +213,20 @@ function parseGuestCount(val) {
 }
 
 // ─────────────────────────────────────────────
+// SANITIZE VALUES — strip Bolna "NULL" strings
+// ─────────────────────────────────────────────
+function cleanVal(val) {
+  if (!val) return '';
+  var s = String(val).trim();
+  if (s.toUpperCase() === 'NULL' || s === '{}' || s === 'undefined') return '';
+  return s;
+}
+
+// ─────────────────────────────────────────────
 // EXTRACT FROM TRANSCRIPT
 // ─────────────────────────────────────────────
 function extractFromTranscript(transcript) {
-  var data = { name: 'Guest', event_type: '', venue_booked: false, venue_name: '', guest_count: '', event_date: '' };
+  var data = { name: '', event_type: '', venue_booked: false, venue_name: '', guest_count: '', event_date: '' };
   if (!transcript) return data;
 
   var nameMatch = transcript.match(/मेरा नाम ([^\n,।]+)/i) ||
@@ -214,14 +249,37 @@ function extractFromTranscript(transcript) {
 }
 
 // ─────────────────────────────────────────────
+// PARSE DURATION from Bolna payload
+// ─────────────────────────────────────────────
+function parseDuration(body) {
+  var d = body.call_duration ||
+          body.duration ||
+          body.call_length ||
+          (body.metadata && body.metadata.call_duration) ||
+          (body.metadata && body.metadata.duration) || 0;
+  var n = parseInt(d);
+  return isNaN(n) ? 0 : n;
+}
+
+// ─────────────────────────────────────────────
 // MAIN WHATSAPP FLOW
 // ─────────────────────────────────────────────
 async function handleWhatsAppFlow(data) {
   console.log('Starting WA flow:', JSON.stringify(data));
 
-  // Step 1: DB (never blocks WhatsApp)
+  // Step 1: DB
   try { await saveVoiceCall(data); } catch(e) { console.error('saveVoiceCall failed:', e.message); }
   try { await upsertLead(data); } catch(e) { console.error('upsertLead failed:', e.message); }
+
+  // Log call as conversation entry for dashboard timeline
+  try {
+    await logConversation(
+      data.phone,
+      'Voice call completed | Event: ' + (data.event_type || 'N/A') +
+      ' | Duration: ' + (data.duration_seconds || 0) + 's',
+      'inbound'
+    );
+  } catch(e) {}
 
   // Step 2: Message 1 — venue booked or venue list
   if (data.venue_booked === true || data.venue_booked === 'true') {
@@ -248,7 +306,7 @@ async function handleWhatsAppFlow(data) {
       '🌐 phoenixeventsandproduction.com');
   }
 
-  // Step 3: Event image from dashboard (optional)
+  // Step 3: Event image from dashboard
   try {
     if (data.event_type) {
       var imageUrl = await getEventImage(data.event_type);
@@ -261,7 +319,7 @@ async function handleWhatsAppFlow(data) {
     }
   } catch(e) { console.error('Image step failed:', e.message); }
 
-  // Step 4: Summary
+  // Step 4: Summary message
   await sendWhatsApp(data.phone,
     '📋 Aapki details humne note kar li hain:\n\n' +
     '🎊 Event: ' + (data.event_type || 'TBD') + '\n' +
@@ -279,7 +337,7 @@ async function handleWhatsAppFlow(data) {
 // ROUTES
 // ─────────────────────────────────────────────
 app.get('/', function(req, res) {
-  res.json({ status: 'Phoenix Events Webhook VERSION 5', timestamp: new Date().toISOString() });
+  res.json({ status: 'Phoenix Events Webhook VERSION 6', timestamp: new Date().toISOString() });
 });
 
 app.post('/phoenix-bolna-agent', async function(req, res) {
@@ -296,7 +354,7 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
     (body.function && body.function.name) ||
     (body.task && body.task.name)) || '';
 
-  // ── CASE 0: Returning caller lookup (initiated status OR get_lead_data tool) ──
+  // ── CASE 0: Returning caller lookup ──
   if (toolName === 'get_lead_data' || (status === 'initiated' && userNumber)) {
     var lookupPhone = (userNumber || '').replace('+', '').replace(/\s/g, '');
     console.log('Looking up lead for:', lookupPhone);
@@ -321,27 +379,31 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
   if (status === 'completed' && userNumber) {
     var phone = userNumber.replace('+', '').replace(/\s/g, '');
     var transcript = body.transcript || '';
-    console.log('COMPLETED CALL for:', phone);
+    var durationSeconds = parseDuration(body);
+    console.log('COMPLETED CALL for:', phone, '| duration:', durationSeconds + 's');
 
     var extracted = extractFromTranscript(transcript);
     var extractions = body.custom_extractions || body.extracted_data || null;
     if (extractions && typeof extractions === 'object') {
-      if (extractions.customer_name) extracted.name = extractions.customer_name;
-      if (extractions.event_type) extracted.event_type = extractions.event_type;
+      if (cleanVal(extractions.customer_name)) extracted.name = cleanVal(extractions.customer_name);
+      if (cleanVal(extractions.event_type)) extracted.event_type = cleanVal(extractions.event_type);
       if (extractions.venue_booked !== undefined) extracted.venue_booked = extractions.venue_booked;
-      if (extractions.venue_name && typeof extractions.venue_name === 'string') extracted.venue_name = extractions.venue_name;
-      if (extractions.guest_count) extracted.guest_count = extractions.guest_count;
-      if (extractions.event_date && typeof extractions.event_date === 'string') extracted.event_date = extractions.event_date;
+      if (cleanVal(extractions.venue_name)) extracted.venue_name = cleanVal(extractions.venue_name);
+      if (cleanVal(String(extractions.guest_count || ''))) extracted.guest_count = cleanVal(String(extractions.guest_count || ''));
+      if (cleanVal(extractions.event_date)) extracted.event_date = cleanVal(extractions.event_date);
     }
+
+    var savedLead = await getLeadByPhone(phone);
 
     var data = {
       phone: phone,
-      name: extracted.name || 'Guest',
-      event_type: extracted.event_type || '',
+      name: cleanVal(extracted.name) || (savedLead && savedLead.name) || 'Guest',
+      event_type: cleanVal(extracted.event_type) || (savedLead && savedLead.event_type) || '',
       venue_booked: extracted.venue_booked || false,
-      venue_name: (extracted.venue_name && typeof extracted.venue_name === 'string') ? extracted.venue_name : '',
-      guest_count: extracted.guest_count || '',
-      event_date: (extracted.event_date && extracted.event_date !== '') ? extracted.event_date : null
+      venue_name: cleanVal(extracted.venue_name) || (savedLead && savedLead.venue) || '',
+      guest_count: cleanVal(extracted.guest_count) || (savedLead && String(savedLead.guest_count || '')) || '',
+      event_date: cleanVal(extracted.event_date) || (savedLead && savedLead.event_date) || null,
+      duration_seconds: durationSeconds
     };
 
     console.log('Extracted data:', JSON.stringify(data));
@@ -357,12 +419,13 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
   if (toolName === 'save_lead_data' || (args && args.event_type && args.name)) {
     var toolData = {
       phone: toolPhone || (args && args.phone) || '',
-      name: (args && args.name) || 'Guest',
-      event_type: (args && args.event_type) || '',
+      name: cleanVal((args && args.name) || '') || 'Guest',
+      event_type: cleanVal((args && args.event_type) || ''),
       venue_booked: (args && args.venue_booked) || false,
-      venue_name: (args && args.venue_name) || '',
-      guest_count: (args && args.guest_count) || '',
-      event_date: (args && args.event_date) || ''
+      venue_name: cleanVal((args && args.venue_name) || ''),
+      guest_count: cleanVal(String((args && args.guest_count) || '')),
+      event_date: cleanVal((args && args.event_date) || '') || null,
+      duration_seconds: parseDuration(body)
     };
     console.log('TOOL save_lead_data:', JSON.stringify(toolData));
     res.json({ result: 'Lead saved! WhatsApp message is being sent.' });
@@ -377,7 +440,6 @@ app.post('/phoenix-bolna-agent', async function(req, res) {
     });
   }
 
-  // All other statuses — ignore silently
   res.json({ status: 'received' });
 });
 
@@ -387,5 +449,5 @@ app.get('/phoenix-bolna-agent', function(req, res) {
 
 var PORT = process.env.PORT || 8080;
 app.listen(PORT, function() {
-  console.log('Phoenix Webhook Server VERSION 5 running on port ' + PORT);
+  console.log('Phoenix Webhook Server VERSION 6 running on port ' + PORT);
 });
